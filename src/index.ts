@@ -3,10 +3,14 @@
  * MCP — Publicador josemaria.ai
  *
  * Tools disponibles:
- *   create_draft   — Crea un artículo en borrador
- *   list_drafts    — Lista los borradores existentes
- *   get_draft      — Lee un borrador concreto
- *   update_draft   — Actualiza título, excerpt, tags, etc. de un borrador
+ *   create_draft          — Crea un artículo en borrador
+ *   list_drafts           — Lista los borradores existentes
+ *   get_draft             — Lee un borrador concreto
+ *   update_draft          — Actualiza título, excerpt, tags, etc. de un borrador
+ *   upload_image          — Sube una imagen local a Cloudinary y devuelve la URL
+ *   list_campaigns        — Lista campañas de email con filtro de estado y métricas básicas
+ *   get_campaign_metrics  — Métricas detalladas de una campaña (enviados, fallidos, fecha)
+ *   send_campaign         — Envía una campaña al segmento configurado (irreversible)
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
