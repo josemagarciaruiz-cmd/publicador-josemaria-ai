@@ -19,6 +19,9 @@ const BASE_URL = (process.env.JOSEMARIA_URL ?? "https://josemaria.ai").replace(
   ""
 );
 const TOKEN = process.env.INGEST_TOKEN ?? "";
+const CLD_CLOUD = process.env.CLOUDINARY_CLOUD_NAME ?? "";
+const CLD_KEY   = process.env.CLOUDINARY_API_KEY ?? "";
+const CLD_SECRET = process.env.CLOUDINARY_API_SECRET ?? "";
 
 if (!TOKEN) {
   process.stderr.write(
@@ -307,6 +310,255 @@ server.tool(
       const msg = err instanceof Error ? err.message : String(err);
       return {
         content: [{ type: "text", text: `❌ Error al actualizar: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ── TOOL: upload_image ─────────────────────────────────────────────────────
+server.tool(
+  "upload_image",
+  "Sube una imagen a Cloudinary y devuelve la URL pública permanente lista para usar en cover_image_url o dentro del HTML de un artículo.",
+  {
+    file_path: z
+      .string()
+      .describe(
+        "Ruta absoluta del fichero de imagen en el sistema local. Ej: /Users/josemariagarciaruiz/Downloads/portada.jpg"
+      ),
+    folder: z
+      .string()
+      .optional()
+      .default("josemaria-ai")
+      .describe("Carpeta de Cloudinary donde se guardará. Por defecto 'josemaria-ai'."),
+    public_id: z
+      .string()
+      .optional()
+      .describe("Nombre identificador en Cloudinary. Si se omite lo genera automáticamente."),
+  },
+  async ({ file_path, folder, public_id }) => {
+    try {
+      if (!CLD_CLOUD || !CLD_KEY || !CLD_SECRET) {
+        throw new Error(
+          "Credenciales de Cloudinary no configuradas (CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET)."
+        );
+      }
+
+      // Leer el fichero como base64
+      const { readFileSync } = await import("fs");
+      const fileBuffer = readFileSync(file_path);
+      const base64 = fileBuffer.toString("base64");
+      const ext = file_path.split(".").pop()?.toLowerCase() ?? "jpg";
+      const mimeTypes: Record<string, string> = {
+        jpg: "image/jpeg", jpeg: "image/jpeg",
+        png: "image/png", gif: "image/gif",
+        webp: "image/webp", svg: "image/svg+xml",
+      };
+      const mime = mimeTypes[ext] ?? "image/jpeg";
+      const dataUri = `data:${mime};base64,${base64}`;
+
+      // Firma para upload autenticado
+      const { createHash } = await import("crypto");
+      const timestamp = Math.floor(Date.now() / 1000);
+      const paramParts: string[] = [`timestamp=${timestamp}`];
+      if (folder) paramParts.push(`folder=${folder}`);
+      if (public_id) paramParts.push(`public_id=${public_id}`);
+      paramParts.sort();
+      const signatureBase = paramParts.join("&") + CLD_SECRET;
+      const signature = createHash("sha256").update(signatureBase).digest("hex");
+
+      // Construir FormData
+      const formData = new FormData();
+      formData.append("file", dataUri);
+      formData.append("api_key", CLD_KEY);
+      formData.append("timestamp", String(timestamp));
+      formData.append("signature", signature);
+      if (folder) formData.append("folder", folder);
+      if (public_id) formData.append("public_id", public_id);
+
+      const res = await fetch(
+        `https://api.cloudinary.com/v1_1/${CLD_CLOUD}/image/upload`,
+        { method: "POST", body: formData }
+      );
+
+      const data = await res.json() as {
+        secure_url?: string;
+        public_id?: string;
+        error?: { message: string };
+      };
+
+      if (!res.ok || data.error) {
+        throw new Error(data.error?.message ?? `HTTP ${res.status}`);
+      }
+
+      const url = data.secure_url!;
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `✅ Imagen subida correctamente.`,
+              ``,
+              `🔗 URL: ${url}`,
+              `📁 Public ID: ${data.public_id}`,
+              ``,
+              `Puedes usar esta URL como cover_image_url en create_draft o update_draft,`,
+              `o pegarla dentro del contenido HTML con <img src="${url}" alt="...">.`,
+            ].join("\n"),
+          },
+        ],
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: "text", text: `❌ Error al subir imagen: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ── list_campaigns ────────────────────────────────────────────────────────
+server.tool(
+  "list_campaigns",
+  "Lista las campañas de email marketing (borradores y enviadas) con métricas básicas.",
+  {
+    status: z
+      .enum(["all", "draft", "ready", "sent"])
+      .optional()
+      .describe("Filtrar por estado. Por defecto muestra todas."),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(50)
+      .optional()
+      .describe("Máximo de resultados (por defecto 20)."),
+  },
+  async ({ status = "all", limit = 20 }) => {
+    try {
+      const params = new URLSearchParams();
+      if (status !== "all") params.set("status", status);
+      params.set("limit", String(limit));
+
+      const data = await api<unknown[]>(
+        `/api/admin/campaigns?${params.toString()}`
+      );
+
+      if (!Array.isArray(data) || data.length === 0) {
+        return {
+          content: [{ type: "text", text: "No hay campañas que coincidan con el filtro." }],
+        };
+      }
+
+      const lines = (data as Record<string, unknown>[]).map((c) => {
+        const status = c.status as string;
+        const icon = status === "sent" ? "✅" : status === "ready" ? "🟡" : "📝";
+        const sentInfo = status === "sent"
+          ? ` | Enviados: ${c.sent_count ?? 0} | Fecha: ${c.sent_at ? new Date(c.sent_at as string).toLocaleDateString("es-ES") : "—"}`
+          : "";
+        return `${icon} [${(c.id as string).slice(0, 8)}] ${c.subject} (${status}, ${c.segment ?? "all"})${sentInfo}`;
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `📧 Campañas (${data.length}):\n\n${lines.join("\n")}`,
+          },
+        ],
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: "text", text: `❌ Error: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ── get_campaign_metrics ──────────────────────────────────────────────────
+server.tool(
+  "get_campaign_metrics",
+  "Obtiene las métricas detalladas de una campaña de email (enviados, fallidos, estado).",
+  {
+    campaign_id: z.string().uuid().describe("ID de la campaña."),
+  },
+  async ({ campaign_id }) => {
+    try {
+      const data = await api<Record<string, unknown>>(
+        `/api/admin/campaigns/${campaign_id}/metrics`
+      );
+
+      const lines = [
+        `📊 Métricas — ${data.subject}`,
+        ``,
+        `Estado:       ${data.status}`,
+        `Segmento:     ${data.segment ?? "all"}`,
+        `Enviados:     ${data.sent_count ?? 0}`,
+        `Fallidos:     ${data.error_count ?? 0}`,
+        `Fecha envío:  ${data.sent_at ? new Date(data.sent_at as string).toLocaleString("es-ES") : "—"}`,
+        `Creada:       ${new Date(data.created_at as string).toLocaleDateString("es-ES")}`,
+      ];
+
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: "text", text: `❌ Error: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ── send_campaign ─────────────────────────────────────────────────────────
+server.tool(
+  "send_campaign",
+  "Envía una campaña de email al segmento configurado. Solo funciona si la campaña está en estado 'draft' o 'ready'. El envío es inmediato e irreversible.",
+  {
+    campaign_id: z.string().uuid().describe("ID de la campaña a enviar."),
+  },
+  async ({ campaign_id }) => {
+    try {
+      const data = await api<Record<string, unknown>>(
+        `/api/admin/email/${campaign_id}/send`,
+        { method: "POST" }
+      );
+
+      if (!data.ok) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `❌ Error al enviar: ${(data as Record<string, unknown>).error ?? "desconocido"}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `✅ Campaña enviada con éxito.`,
+              ``,
+              `Destinatarios totales: ${data.total}`,
+              `Enviados correctamente: ${data.sent}`,
+              `Errores: ${data.errors ?? 0}`,
+            ].join("\n"),
+          },
+        ],
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: "text", text: `❌ Error: ${msg}` }],
         isError: true,
       };
     }
