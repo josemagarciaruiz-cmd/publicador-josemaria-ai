@@ -23,6 +23,8 @@ const BASE_URL = (process.env.JOSEMARIA_URL ?? "https://josemaria.ai").replace(
   ""
 );
 const TOKEN = process.env.INGEST_TOKEN ?? "";
+const NOTION_TOKEN = process.env.NOTION_TOKEN ?? "";
+const NOTION_ROOT_PAGE_ID = (process.env.NOTION_ROOT_PAGE_ID ?? "").replace(/-/g, "");
 const CLD_CLOUD = process.env.CLOUDINARY_CLOUD_NAME ?? "";
 const CLD_KEY   = process.env.CLOUDINARY_API_KEY ?? "";
 const CLD_SECRET = process.env.CLOUDINARY_API_SECRET ?? "";
@@ -67,6 +69,202 @@ async function api<T>(
   }
 
   return data as T;
+}
+
+type NotionRichText = Array<{
+  plain_text?: string;
+  href?: string | null;
+  annotations?: {
+    bold?: boolean;
+    italic?: boolean;
+    strikethrough?: boolean;
+    underline?: boolean;
+    code?: boolean;
+  };
+}>;
+
+type NotionBlock = {
+  id: string;
+  type: string;
+  has_children?: boolean;
+  [key: string]: any;
+};
+
+function normalizeNotionId(value: string): string {
+  const clean = value.trim().replace(/-/g, "");
+  if (!/^[0-9a-fA-F]{32}$/.test(clean)) {
+    throw new Error("ID de Notion inválido.");
+  }
+  return clean.replace(
+    /(.{8})(.{4})(.{4})(.{4})(.{12})/,
+    "$1-$2-$3-$4-$5"
+  );
+}
+
+function extractNotionId(input: string): string {
+  const trimmed = input.trim();
+  if (/^[0-9a-fA-F-]{32,36}$/.test(trimmed)) {
+    return normalizeNotionId(trimmed);
+  }
+  const match = trimmed.match(/([0-9a-fA-F]{32})(?:\?|$)/) || trimmed.match(/([0-9a-fA-F]{8}-[0-9a-fA-F-]{27})/);
+  if (!match) throw new Error("No pude extraer un page/database id válido desde Notion.");
+  return normalizeNotionId(match[1]);
+}
+
+function notionPlainText(richText: NotionRichText = []): string {
+  return richText.map((item) => item.plain_text ?? "").join("");
+}
+
+function notionToHtmlInline(richText: NotionRichText = []): string {
+  const escapeHtml = (value: string) => value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+  return richText.map((item) => {
+    let text = escapeHtml(item.plain_text ?? "");
+    if (!text) return "";
+    if (item.annotations?.code) text = `<code>${text}</code>`;
+    if (item.annotations?.bold) text = `<strong>${text}</strong>`;
+    if (item.annotations?.italic) text = `<em>${text}</em>`;
+    if (item.annotations?.underline) text = `<u>${text}</u>`;
+    if (item.annotations?.strikethrough) text = `<s>${text}</s>`;
+    if (item.href) text = `<a href="${item.href}">${text}</a>`;
+    return text;
+  }).join("");
+}
+
+async function notionApi<T>(path: string, options: RequestInit = {}): Promise<T> {
+  if (!NOTION_TOKEN) {
+    throw new Error("NOTION_TOKEN no configurado.");
+  }
+
+  const res = await fetch(`https://api.notion.com/v1${path}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${NOTION_TOKEN}`,
+      "Notion-Version": "2022-06-28",
+      "Content-Type": "application/json",
+      ...(options.headers ?? {}),
+    },
+  });
+
+  const text = await res.text();
+  let data: unknown;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { raw: text };
+  }
+
+  if (!res.ok) {
+    const msg =
+      typeof data === "object" && data !== null && "message" in data && typeof (data as { message: unknown }).message === "string"
+        ? (data as { message: string }).message
+        : `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+
+  return data as T;
+}
+
+async function fetchAllBlockChildren(blockId: string): Promise<NotionBlock[]> {
+  let cursor: string | undefined;
+  const all: NotionBlock[] = [];
+
+  do {
+    const qs = new URLSearchParams({ page_size: "100" });
+    if (cursor) qs.set("start_cursor", cursor);
+    const data = await notionApi<{ results: NotionBlock[]; next_cursor: string | null; has_more: boolean }>(
+      `/blocks/${blockId}/children?${qs.toString()}`,
+      { method: "GET" }
+    );
+    all.push(...data.results);
+    cursor = data.has_more ? data.next_cursor ?? undefined : undefined;
+  } while (cursor);
+
+  return all;
+}
+
+async function blocksToHtml(blocks: NotionBlock[]): Promise<string> {
+  const parts: string[] = [];
+  for (const block of blocks) {
+    const value = block[block.type] ?? {};
+    if (block.type === "paragraph") {
+      const html = notionToHtmlInline(value.rich_text);
+      if (html.trim()) parts.push(`<p>${html}</p>`);
+      continue;
+    }
+    if (block.type === "heading_1") {
+      parts.push(`<h2>${notionToHtmlInline(value.rich_text)}</h2>`);
+      continue;
+    }
+    if (block.type === "heading_2") {
+      parts.push(`<h2>${notionToHtmlInline(value.rich_text)}</h2>`);
+      continue;
+    }
+    if (block.type === "heading_3") {
+      parts.push(`<h3>${notionToHtmlInline(value.rich_text)}</h3>`);
+      continue;
+    }
+    if (block.type === "bulleted_list_item") {
+      parts.push(`<ul><li>${notionToHtmlInline(value.rich_text)}</li></ul>`);
+      continue;
+    }
+    if (block.type === "numbered_list_item") {
+      parts.push(`<ol><li>${notionToHtmlInline(value.rich_text)}</li></ol>`);
+      continue;
+    }
+    if (block.type === "quote") {
+      parts.push(`<blockquote>${notionToHtmlInline(value.rich_text)}</blockquote>`);
+      continue;
+    }
+    if (block.type === "callout") {
+      parts.push(`<blockquote>${notionToHtmlInline(value.rich_text)}</blockquote>`);
+      continue;
+    }
+    if (block.type === "divider") {
+      parts.push("<hr>");
+      continue;
+    }
+    if (block.type === "code") {
+      parts.push(`<pre><code>${notionToHtmlInline(value.rich_text)}</code></pre>`);
+      continue;
+    }
+    if (block.type === "to_do") {
+      const checked = value.checked ? "x" : " ";
+      parts.push(`<p>[${checked}] ${notionToHtmlInline(value.rich_text)}</p>`);
+      continue;
+    }
+    if (block.has_children) {
+      const children = await fetchAllBlockChildren(block.id);
+      const nested = await blocksToHtml(children);
+      if (nested.trim()) parts.push(nested);
+    }
+  }
+  return parts.join("\n");
+}
+
+function notionPropertyValue(property: any): string {
+  if (!property) return "—";
+  switch (property.type) {
+    case "title":
+      return notionPlainText(property.title);
+    case "rich_text":
+      return notionPlainText(property.rich_text);
+    case "select":
+      return property.select?.name ?? "—";
+    case "status":
+      return property.status?.name ?? "—";
+    case "date":
+      return property.date?.start ?? "—";
+    case "url":
+      return property.url ?? "—";
+    case "created_time":
+      return property.created_time ?? "—";
+    default:
+      return "—";
+  }
 }
 
 // ── Servidor MCP ───────────────────────────────────────────────────────────
@@ -416,6 +614,154 @@ server.tool(
       const msg = err instanceof Error ? err.message : String(err);
       return {
         content: [{ type: "text", text: `❌ Error al subir imagen: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// ── TOOLS: Notion ──────────────────────────────────────────────────────────
+server.tool(
+  "list_notion_items",
+  "Lista piezas dentro de la base editorial de Notion conectada al MCP.",
+  {
+    database_id_or_url: z
+      .string()
+      .optional()
+      .describe("ID o URL de la base de datos de Notion. Si se omite, usa la base hija encontrada bajo NOTION_ROOT_PAGE_ID."),
+    limit: z.number().int().min(1).max(20).default(10),
+  },
+  async ({ database_id_or_url, limit }) => {
+    try {
+      let databaseId = database_id_or_url ? extractNotionId(database_id_or_url) : "";
+
+      if (!databaseId) {
+        if (!NOTION_ROOT_PAGE_ID) throw new Error("Falta NOTION_ROOT_PAGE_ID y no se indicó database_id_or_url.");
+        const children = await fetchAllBlockChildren(normalizeNotionId(NOTION_ROOT_PAGE_ID));
+        const dbBlock = children.find((b) => b.type === "child_database");
+        if (!dbBlock) throw new Error("No encontré ninguna base de datos hija bajo la página raíz configurada.");
+        databaseId = dbBlock.id;
+      }
+
+      const db = await notionApi<{ title?: NotionRichText }>(`/databases/${databaseId}`, { method: "GET" });
+      const data = await notionApi<{ results: Array<{ id: string; url: string; properties: Record<string, any> }> }>(
+        `/databases/${databaseId}/query`,
+        { method: "POST", body: JSON.stringify({ page_size: limit }) }
+      );
+
+      const lines = [`🗂️ Notion — ${notionPlainText(db.title) || "Base editorial"}`, ""];
+      for (const [i, page] of data.results.entries()) {
+        const p = page.properties;
+        lines.push(`${i + 1}. ${notionPropertyValue(p["Título"] ?? p["Name"] ?? p["title"])}`);
+        lines.push(`   ID: ${page.id}`);
+        lines.push(`   Estado: ${notionPropertyValue(p["Estado"])}`);
+        lines.push(`   Formato: ${notionPropertyValue(p["Formato"])}`);
+        lines.push(`   Clasificación: ${notionPropertyValue(p["Clasificación"])}`);
+        lines.push(`   URL: ${page.url}`);
+        lines.push("");
+      }
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: "text", text: `❌ Error leyendo Notion: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.tool(
+  "get_notion_page",
+  "Lee una pieza concreta de Notion y devuelve metadatos + extracto + HTML generado desde sus bloques.",
+  {
+    page_id_or_url: z.string().describe("ID o URL de la página de Notion."),
+  },
+  async ({ page_id_or_url }) => {
+    try {
+      const pageId = extractNotionId(page_id_or_url);
+      const page = await notionApi<{ id: string; url: string; properties: Record<string, any> }>(`/pages/${pageId}`, { method: "GET" });
+      const blocks = await fetchAllBlockChildren(pageId);
+      const html = await blocksToHtml(blocks);
+      const title = notionPropertyValue(page.properties["Título"] ?? page.properties["Name"] ?? page.properties["title"]);
+      const lines = [
+        `📄 ${title}`,
+        `ID: ${page.id}`,
+        `Estado: ${notionPropertyValue(page.properties["Estado"])}`,
+        `Formato: ${notionPropertyValue(page.properties["Formato"])}`,
+        `Clasificación: ${notionPropertyValue(page.properties["Clasificación"])}`,
+        `Etiquetas: ${notionPropertyValue(page.properties["Etiquetas"])}`,
+        `URL: ${page.url}`,
+        "",
+        "── HTML generado ──",
+        html || "(sin bloques convertibles)",
+      ];
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: "text", text: `❌ Error leyendo la página de Notion: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.tool(
+  "create_draft_from_notion",
+  "Convierte una página de Notion en borrador de josemaria.ai usando sus metadatos editoriales y el cuerpo convertido a HTML.",
+  {
+    page_id_or_url: z.string().describe("ID o URL de la página de Notion."),
+    slug: z.string().optional().describe("Slug manual si quieres forzarlo."),
+    excerpt: z.string().max(160).optional().describe("Excerpt manual si quieres sobrescribirlo."),
+    access_level: z.enum(["free", "premium"]).optional().describe("Sobrescribe el acceso si no quieres inferirlo desde Clasificación."),
+  },
+  async ({ page_id_or_url, slug, excerpt, access_level }) => {
+    try {
+      const pageId = extractNotionId(page_id_or_url);
+      const page = await notionApi<{ id: string; url: string; properties: Record<string, any> }>(`/pages/${pageId}`, { method: "GET" });
+      const blocks = await fetchAllBlockChildren(pageId);
+      const content = await blocksToHtml(blocks);
+      const title = notionPropertyValue(page.properties["Título"] ?? page.properties["Name"] ?? page.properties["title"]);
+      const tagsRaw = notionPropertyValue(page.properties["Etiquetas"]);
+      const tags = tagsRaw === "—" ? undefined : tagsRaw.split(",").map((tag) => tag.trim()).filter(Boolean);
+      const classification = notionPropertyValue(page.properties["Clasificación"]);
+      const inferredAccess = classification.toLowerCase().includes("premium") ? "premium" : "free";
+      const generatedExcerpt = content.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 160);
+      const finalExcerpt = excerpt ?? (generatedExcerpt || undefined);
+
+      const result = await api<{ url: string; slug: string }>("/api/admin/posts/ingest", {
+        method: "POST",
+        body: JSON.stringify({
+          title,
+          content,
+          excerpt: finalExcerpt,
+          slug,
+          access_level: access_level ?? inferredAccess,
+          tags,
+        }),
+      });
+
+      return {
+        content: [{
+          type: "text",
+          text: [
+            `✅ Borrador creado desde Notion.`,
+            ``,
+            `📝 Título: ${title}`,
+            `🔗 Notion: ${page.url}`,
+            `🔗 Panel: ${result.url}`,
+            `🏷️ Slug: ${result.slug}`,
+            `🔒 Acceso: ${access_level ?? inferredAccess}`,
+          ].join("\n"),
+        }],
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: "text", text: `❌ Error creando borrador desde Notion: ${msg}` }],
         isError: true,
       };
     }
