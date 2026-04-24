@@ -25,6 +25,8 @@ const BASE_URL = (process.env.JOSEMARIA_URL ?? "https://josemaria.ai").replace(
 const TOKEN = process.env.INGEST_TOKEN ?? "";
 const NOTION_TOKEN = process.env.NOTION_TOKEN ?? "";
 const NOTION_ROOT_PAGE_ID = (process.env.NOTION_ROOT_PAGE_ID ?? "").replace(/-/g, "");
+const NOTION_PRODUCTION_DB_ID = process.env.NOTION_PRODUCTION_DB_ID ?? "";
+const NOTION_RADAR_DB_ID = process.env.NOTION_RADAR_DB_ID ?? "";
 const CLD_CLOUD = process.env.CLOUDINARY_CLOUD_NAME ?? "";
 const CLD_KEY   = process.env.CLOUDINARY_API_KEY ?? "";
 const CLD_SECRET = process.env.CLOUDINARY_API_SECRET ?? "";
@@ -265,6 +267,25 @@ function notionPropertyValue(property: any): string {
     default:
       return "—";
   }
+}
+
+async function queryNotionDatabase(databaseId: string, limit: number): Promise<Array<{ id: string; url: string; properties: Record<string, any> }>> {
+  const data = await notionApi<{ results: Array<{ id: string; url: string; properties: Record<string, any> }> }>(
+    `/databases/${databaseId}/query`,
+    { method: "POST", body: JSON.stringify({ page_size: limit }) }
+  );
+  return data.results;
+}
+
+async function createNotionPage(databaseId: string, properties: Record<string, any>, children: any[] = []): Promise<any> {
+  return notionApi(`/pages`, {
+    method: "POST",
+    body: JSON.stringify({
+      parent: { database_id: databaseId },
+      properties,
+      children,
+    }),
+  });
 }
 
 // ── Servidor MCP ───────────────────────────────────────────────────────────
@@ -644,13 +665,10 @@ server.tool(
       }
 
       const db = await notionApi<{ title?: NotionRichText }>(`/databases/${databaseId}`, { method: "GET" });
-      const data = await notionApi<{ results: Array<{ id: string; url: string; properties: Record<string, any> }> }>(
-        `/databases/${databaseId}/query`,
-        { method: "POST", body: JSON.stringify({ page_size: limit }) }
-      );
+      const rows = await queryNotionDatabase(databaseId, limit);
 
       const lines = [`🗂️ Notion — ${notionPlainText(db.title) || "Base editorial"}`, ""];
-      for (const [i, page] of data.results.entries()) {
+      for (const [i, page] of rows.entries()) {
         const p = page.properties;
         lines.push(`${i + 1}. ${notionPropertyValue(p["Título"] ?? p["Name"] ?? p["title"])}`);
         lines.push(`   ID: ${page.id}`);
@@ -762,6 +780,113 @@ server.tool(
       const msg = err instanceof Error ? err.message : String(err);
       return {
         content: [{ type: "text", text: `❌ Error creando borrador desde Notion: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.tool(
+  "list_notion_radar",
+  "Lista entradas del radar jurídico y de fuentes en Notion.",
+  {
+    limit: z.number().int().min(1).max(20).default(10),
+  },
+  async ({ limit }) => {
+    try {
+      if (!NOTION_RADAR_DB_ID) throw new Error("NOTION_RADAR_DB_ID no configurado.");
+      const db = await notionApi<{ title?: NotionRichText }>(`/databases/${NOTION_RADAR_DB_ID}`, { method: "GET" });
+      const rows = await queryNotionDatabase(NOTION_RADAR_DB_ID, limit);
+      const lines = [`🧭 Radar — ${notionPlainText(db.title) || "Radar jurídico"}`, ""];
+      for (const [i, page] of rows.entries()) {
+        const p = page.properties;
+        lines.push(`${i + 1}. ${notionPropertyValue(p["Título"] ?? p["Name"] ?? p["title"])}`);
+        lines.push(`   ID: ${page.id}`);
+        lines.push(`   Tipo: ${notionPropertyValue(p["Tipo"])}`);
+        lines.push(`   Estado: ${notionPropertyValue(p["Estado"])}`);
+        lines.push(`   Impacto: ${notionPropertyValue(p["Impacto"])}`);
+        lines.push(`   Fuente: ${notionPropertyValue(p["Fuente oficial"])}`);
+        lines.push("");
+      }
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: "text", text: `❌ Error leyendo el radar: ${msg}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.tool(
+  "create_production_item_from_radar",
+  "Crea una nueva pieza en Producción editorial a partir de una entrada del radar jurídico de Notion.",
+  {
+    radar_page_id_or_url: z.string().describe("ID o URL de la entrada del radar."),
+    formato: z.enum(["Blog", "LinkedIn", "YouTube", "Email", "Premium"]).default("Blog"),
+    canal: z.enum(["josemaria.ai", "LinkedIn", "YouTube", "Email", "Comunidad"]).default("josemaria.ai"),
+    clasificacion: z.enum(["Libre", "Premium 15€", "Premium Plus 30€"]).default("Libre"),
+    prioridad: z.enum(["Alta", "Media", "Baja"]).default("Media"),
+  },
+  async ({ radar_page_id_or_url, formato, canal, clasificacion, prioridad }) => {
+    try {
+      if (!NOTION_PRODUCTION_DB_ID) throw new Error("NOTION_PRODUCTION_DB_ID no configurado.");
+      const radarId = extractNotionId(radar_page_id_or_url);
+      const radarPage = await notionApi<{ id: string; url: string; properties: Record<string, any> }>(`/pages/${radarId}`, { method: "GET" });
+      const radarBlocks = await fetchAllBlockChildren(radarId);
+      const title = notionPropertyValue(radarPage.properties["Título"] ?? radarPage.properties["Name"] ?? radarPage.properties["title"]);
+      const notes = notionPropertyValue(radarPage.properties["Notas"]);
+      const sourceUrl = notionPropertyValue(radarPage.properties["Fuente oficial"]);
+      const impact = notionPropertyValue(radarPage.properties["Impacto"]);
+      const type = notionPropertyValue(radarPage.properties["Tipo"]);
+      const dateKey = notionPropertyValue(radarPage.properties["Fecha clave"]);
+
+      const children = radarBlocks.length ? radarBlocks.map((block) => ({
+        object: "block",
+        type: block.type,
+        [block.type]: block[block.type],
+      })) : [];
+
+      const created = await createNotionPage(
+        NOTION_PRODUCTION_DB_ID,
+        {
+          "Título": { title: [{ text: { content: title } }] },
+          "Estado": { status: { name: "Idea" } },
+          "Formato": { select: { name: formato } },
+          "Canal": { select: { name: canal } },
+          "Clasificación": { select: { name: clasificacion } },
+          "Prioridad": { select: { name: prioridad } },
+          "Fuente base": sourceUrl === "—" ? undefined : { url: sourceUrl },
+          "Notas operativas": {
+            rich_text: [{ text: { content: [
+              type !== "—" ? `Tipo: ${type}` : "",
+              impact !== "—" ? `Impacto: ${impact}` : "",
+              dateKey !== "—" ? `Fecha clave: ${dateKey}` : "",
+              notes !== "—" ? `Notas radar: ${notes}` : "",
+            ].filter(Boolean).join(" | ") } }],
+          },
+        },
+        children
+      );
+
+      return {
+        content: [{
+          type: "text",
+          text: [
+            `✅ Pieza creada en Producción editorial desde el radar.`,
+            ``,
+            `📝 Título: ${title}`,
+            `🧭 Radar: ${radarPage.url}`,
+            `🗂️ Producción: ${created.url}`,
+            `Formato: ${formato} | Canal: ${canal} | Clasificación: ${clasificacion}`,
+          ].join("\n"),
+        }],
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: "text", text: `❌ Error creando pieza desde el radar: ${msg}` }],
         isError: true,
       };
     }
