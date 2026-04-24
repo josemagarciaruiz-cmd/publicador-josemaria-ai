@@ -288,6 +288,13 @@ async function createNotionPage(databaseId: string, properties: Record<string, a
   });
 }
 
+async function updateNotionPage(pageId: string, properties: Record<string, any>): Promise<any> {
+  return notionApi(`/pages/${pageId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ properties }),
+  });
+}
+
 // ── Servidor MCP ───────────────────────────────────────────────────────────
 const server = new McpServer({
   name: "publicador-josemaria-ai",
@@ -735,8 +742,9 @@ server.tool(
     slug: z.string().optional().describe("Slug manual si quieres forzarlo."),
     excerpt: z.string().max(160).optional().describe("Excerpt manual si quieres sobrescribirlo."),
     access_level: z.enum(["free", "premium"]).optional().describe("Sobrescribe el acceso si no quieres inferirlo desde Clasificación."),
+    update_notion_status: z.boolean().default(true).describe("Si es true, actualiza el estado de la pieza en Notion tras crear el borrador."),
   },
-  async ({ page_id_or_url, slug, excerpt, access_level }) => {
+  async ({ page_id_or_url, slug, excerpt, access_level, update_notion_status }) => {
     try {
       const pageId = extractNotionId(page_id_or_url);
       const page = await notionApi<{ id: string; url: string; properties: Record<string, any> }>(`/pages/${pageId}`, { method: "GET" });
@@ -762,6 +770,16 @@ server.tool(
         }),
       });
 
+      if (update_notion_status) {
+        const properties: Record<string, any> = {
+          "Estado": { status: { name: "Listo para publicar" } },
+        };
+        if (page.properties["URL publicada"]) {
+          properties["URL publicada"] = { url: result.url };
+        }
+        await updateNotionPage(pageId, properties);
+      }
+
       return {
         content: [{
           type: "text",
@@ -773,6 +791,7 @@ server.tool(
             `🔗 Panel: ${result.url}`,
             `🏷️ Slug: ${result.slug}`,
             `🔒 Acceso: ${access_level ?? inferredAccess}`,
+            update_notion_status ? `🗂️ Estado Notion: Listo para publicar` : `🗂️ Estado Notion: sin cambios`,
           ].join("\n"),
         }],
       };
@@ -828,8 +847,9 @@ server.tool(
     canal: z.enum(["josemaria.ai", "LinkedIn", "YouTube", "Email", "Comunidad"]).default("josemaria.ai"),
     clasificacion: z.enum(["Libre", "Premium 15€", "Premium Plus 30€"]).default("Libre"),
     prioridad: z.enum(["Alta", "Media", "Baja"]).default("Media"),
+    update_radar_status: z.boolean().default(true).describe("Si es true, marca la entrada del radar como aprovechada tras crear la pieza."),
   },
-  async ({ radar_page_id_or_url, formato, canal, clasificacion, prioridad }) => {
+  async ({ radar_page_id_or_url, formato, canal, clasificacion, prioridad, update_radar_status }) => {
     try {
       if (!NOTION_PRODUCTION_DB_ID) throw new Error("NOTION_PRODUCTION_DB_ID no configurado.");
       const radarId = extractNotionId(radar_page_id_or_url);
@@ -848,27 +868,35 @@ server.tool(
         [block.type]: block[block.type],
       })) : [];
 
+      const productionProperties: Record<string, any> = {
+        "Título": { title: [{ text: { content: title } }] },
+        "Estado": { status: { name: "Idea" } },
+        "Formato": { select: { name: formato } },
+        "Canal": { select: { name: canal } },
+        "Clasificación": { select: { name: clasificacion } },
+        "Prioridad": { select: { name: prioridad } },
+        "Notas operativas": {
+          rich_text: [{ text: { content: [
+            type !== "—" ? `Tipo: ${type}` : "",
+            impact !== "—" ? `Impacto: ${impact}` : "",
+            dateKey !== "—" ? `Fecha clave: ${dateKey}` : "",
+            notes !== "—" ? `Notas radar: ${notes}` : "",
+          ].filter(Boolean).join(" | ") } }],
+        },
+      };
+      if (sourceUrl !== "—") productionProperties["Fuente base"] = { url: sourceUrl };
+
       const created = await createNotionPage(
         NOTION_PRODUCTION_DB_ID,
-        {
-          "Título": { title: [{ text: { content: title } }] },
-          "Estado": { status: { name: "Idea" } },
-          "Formato": { select: { name: formato } },
-          "Canal": { select: { name: canal } },
-          "Clasificación": { select: { name: clasificacion } },
-          "Prioridad": { select: { name: prioridad } },
-          "Fuente base": sourceUrl === "—" ? undefined : { url: sourceUrl },
-          "Notas operativas": {
-            rich_text: [{ text: { content: [
-              type !== "—" ? `Tipo: ${type}` : "",
-              impact !== "—" ? `Impacto: ${impact}` : "",
-              dateKey !== "—" ? `Fecha clave: ${dateKey}` : "",
-              notes !== "—" ? `Notas radar: ${notes}` : "",
-            ].filter(Boolean).join(" | ") } }],
-          },
-        },
+        productionProperties,
         children
       );
+
+      if (update_radar_status) {
+        await updateNotionPage(radarId, {
+          "Estado": { status: { name: "Aprovechada" } },
+        });
+      }
 
       return {
         content: [{
@@ -880,6 +908,7 @@ server.tool(
             `🧭 Radar: ${radarPage.url}`,
             `🗂️ Producción: ${created.url}`,
             `Formato: ${formato} | Canal: ${canal} | Clasificación: ${clasificacion}`,
+            update_radar_status ? `🧭 Estado radar: Aprovechada` : `🧭 Estado radar: sin cambios`,
           ].join("\n"),
         }],
       };
